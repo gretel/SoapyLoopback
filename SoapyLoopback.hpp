@@ -40,6 +40,10 @@
 class SoapyLoopback: public SoapySDR::Device
 {
 public:
+    // Sentinel pointers to distinguish RX vs TX streams
+    static SoapySDR::Stream* const kRxStream;
+    static SoapySDR::Stream* const kTxStream;
+
     SoapyLoopback(const SoapySDR::Kwargs &args);
 
     ~SoapyLoopback(void);
@@ -93,6 +97,14 @@ public:
             const size_t numElems,
             int &flags,
             long long &timeNs,
+            const long timeoutUs = 100000);
+
+    int writeStream(
+            SoapySDR::Stream *stream,
+            const void * const *buffs,
+            const size_t numElems,
+            int &flags,
+            const long long timeNs = 0,
             const long timeoutUs = 100000);
 
     /*******************************************************************
@@ -306,4 +318,27 @@ public:
     std::atomic<bool> resetBuffer;
 
     double gainMin, gainMax;
+
+    // Stream setup tracking
+    bool _rxStreamSetup;
+    bool _txStreamSetup;
+
+    // TX state
+    bool _txActive;
+    size_t _txBufferLength;
+    size_t _txNumBuffers;
+
+    // Loopback format tracking
+    std::string _loopbackFormat;  // Store the format for loopback operations
+    size_t _loopbackBytesPerSample;  // Bytes per sample for the loopback format
+
+    // Loopback ring buffer (TX writes here, RX reads from here)
+    std::mutex _loopback_mutex;
+    std::condition_variable _loopback_cond;
+    std::vector<Buffer> _loopback_buffs;
+    size_t _loopback_head;
+    size_t _loopback_tail;
+    std::atomic<size_t> _loopback_count;
+    std::atomic<bool> _loopback_overflow;
+    bool _loopbackEnabled;  // when true, RX reads from loopback buffer instead of synthetic data
 };

@@ -31,6 +31,10 @@
 #include <climits> //SHRT_MAX
 #include <cstring> // memcpy
 
+// Define sentinel stream pointers (C++11 compatible)
+SoapySDR::Stream* const SoapyLoopback::kRxStream = reinterpret_cast<SoapySDR::Stream*>(static_cast<uintptr_t>(1));
+SoapySDR::Stream* const SoapyLoopback::kTxStream = reinterpret_cast<SoapySDR::Stream*>(static_cast<uintptr_t>(2));
+
 
 std::vector<std::string> SoapyLoopback::getStreamFormats(const int direction, const size_t channel) const {
     std::vector<std::string> formats;
@@ -147,34 +151,49 @@ SoapySDR::Stream *SoapyLoopback::setupStream(
         throw std::runtime_error("setupStream invalid channel selection");
     }
 
-    //check the format
+    //check the format and determine bytes per sample
+    size_t bytesPerSample = 0;
     if (format == SOAPY_SDR_CF32)
     {
         SoapySDR_log(SOAPY_SDR_INFO, "Using format CF32.");
-        //rxFormat = RTL_RX_FORMAT_FLOAT32;
-    }
-    else if (format == SOAPY_SDR_CS12)
-    {
-        SoapySDR_log(SOAPY_SDR_INFO, "Using format CS12.");
-        //rxFormat = RTL_RX_FORMAT_INT16;
+        bytesPerSample = 8;  // 2 * sizeof(float)
     }
     else if (format == SOAPY_SDR_CS16)
     {
         SoapySDR_log(SOAPY_SDR_INFO, "Using format CS16.");
-        //rxFormat = RTL_RX_FORMAT_INT16;
+        bytesPerSample = 4;  // 2 * sizeof(int16_t)
+    }
+    else if (format == SOAPY_SDR_CS12)
+    {
+        SoapySDR_log(SOAPY_SDR_INFO, "Using format CS12.");
+        bytesPerSample = 3;  // packed 12-bit I/Q
     }
     else if (format == SOAPY_SDR_CS8) {
         SoapySDR_log(SOAPY_SDR_INFO, "Using format CS8.");
-        //rxFormat = RTL_RX_FORMAT_INT8;
+        bytesPerSample = 2;  // 2 * sizeof(int8_t)
     }
     else
     {
         throw std::runtime_error(
                 "setupStream invalid format '" + format
-                        + "' -- Only CS8, CS16 and CF32 are supported by SoapyLoopback module.");
+                        + "' -- Only CS8, CS12, CS16 and CF32 are supported by SoapyLoopback module.");
     }
 
-    bufferLength = DEFAULT_BUFFER_LENGTH;
+    // Store format for loopback operations (first stream setup wins)
+    if (_loopbackFormat.empty())
+    {
+        _loopbackFormat = format;
+        _loopbackBytesPerSample = bytesPerSample;
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "Loopback format set to %s (%zu bytes/sample)", format.c_str(), bytesPerSample);
+    }
+    else if (_loopbackFormat != format)
+    {
+        SoapySDR_logf(SOAPY_SDR_WARNING, "Loopback: TX and RX using different formats (%s vs %s). Using %s for loopback.",
+            _loopbackFormat.c_str(), format.c_str(), _loopbackFormat.c_str());
+    }
+
+    // Parse buffer configuration
+    size_t localBufferLength = DEFAULT_BUFFER_LENGTH;
     if (args.count("bufflen") != 0)
     {
         try
@@ -182,14 +201,13 @@ SoapySDR::Stream *SoapyLoopback::setupStream(
             int bufferLength_in = std::stoi(args.at("bufflen"));
             if (bufferLength_in > 0)
             {
-                bufferLength = bufferLength_in;
+                localBufferLength = bufferLength_in;
             }
         }
         catch (const std::invalid_argument &){}
     }
-    SoapySDR_logf(SOAPY_SDR_DEBUG, "RTL-SDR Using buffer length %d", bufferLength);
 
-    numBuffers = DEFAULT_NUM_BUFFERS;
+    size_t localNumBuffers = DEFAULT_NUM_BUFFERS;
     if (args.count("buffers") != 0)
     {
         try
@@ -197,62 +215,106 @@ SoapySDR::Stream *SoapyLoopback::setupStream(
             int numBuffers_in = std::stoi(args.at("buffers"));
             if (numBuffers_in > 0)
             {
-                numBuffers = numBuffers_in;
+                localNumBuffers = numBuffers_in;
             }
         }
         catch (const std::invalid_argument &){}
     }
-    SoapySDR_logf(SOAPY_SDR_DEBUG, "RTL-SDR Using %d buffers", numBuffers);
 
-    asyncBuffs = 0;
-    if (args.count("asyncBuffs") != 0)
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "Loopback setupStream: direction=%s, buffer length %zu, %zu buffers",
+        direction == SOAPY_SDR_RX ? "RX" : "TX", localBufferLength, localNumBuffers);
+
+    if (direction == SOAPY_SDR_RX)
     {
-        try
+        // RX stream setup: allocate RX buffers
+        if (_buffs.empty())
         {
-            int asyncBuffs_in = std::stoi(args.at("asyncBuffs"));
-            if (asyncBuffs_in > 0)
+            bufferLength = localBufferLength;
+            numBuffers = localNumBuffers;
+
+            asyncBuffs = 0;
+            if (args.count("asyncBuffs") != 0)
             {
-                asyncBuffs = asyncBuffs_in;
+                try
+                {
+                    int asyncBuffs_in = std::stoi(args.at("asyncBuffs"));
+                    if (asyncBuffs_in > 0)
+                    {
+                        asyncBuffs = asyncBuffs_in;
+                    }
+                }
+                catch (const std::invalid_argument &){}
             }
+
+            // Initialize RX fifo
+            _buf_tail = 0;
+            _buf_count = 0;
+            _buf_head = 0;
+
+            // Allocate RX buffers
+            _buffs.resize(numBuffers);
+            for (auto &buff : _buffs) buff.data.reserve(bufferLength);
+            for (auto &buff : _buffs) buff.data.resize(bufferLength);
+
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "Loopback: RX buffers allocated (%zu buffers, %zu bytes each)", numBuffers, bufferLength);
         }
-        catch (const std::invalid_argument &){}
+
+        _rxStreamSetup = true;
+        return kRxStream;
     }
-    //if (tunerType == RTLSDR_TUNER_E4000) {
-    //    IFGain[0] = 6;
-    //    IFGain[1] = 9;
-    //    IFGain[2] = 3;
-    //    IFGain[3] = 2;
-    //    IFGain[4] = 3;
-    //    IFGain[5] = 3;
-    //} else {
-    //    for (int i = 0; i < 6; i++) {
-    //        IFGain[i] = 0;
-    //    }
-    //}
-    //tunerGain = rtlsdr_get_tuner_gain(dev) / 10.0;
+    else
+    {
+        // TX stream setup: allocate loopback buffers and enable loopback
+        if (_loopback_buffs.empty())
+        {
+            _txBufferLength = localBufferLength * 4;
+            _txNumBuffers = localNumBuffers;
 
-    //clear async fifo counts
-    _buf_tail = 0;
-    _buf_count = 0;
-    _buf_head = 0;
+            // Initialize loopback ring buffer (TX -> RX path)
+            _loopback_head = 0;
+            _loopback_tail = 0;
+            _loopback_count = 0;
+            _loopback_overflow = false;
 
-    //allocate buffers
-    _buffs.resize(numBuffers);
-    for (auto &buff : _buffs) buff.data.reserve(bufferLength);
-    for (auto &buff : _buffs) buff.data.resize(bufferLength);
+            // Allocate loopback buffers
+            _loopback_buffs.resize(_txNumBuffers);
+            for (auto &buff : _loopback_buffs) buff.data.reserve(_txBufferLength);
+            for (auto &buff : _loopback_buffs) buff.data.resize(_txBufferLength);
 
-    return (SoapySDR::Stream *) this;
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "Loopback: TX loopback buffers allocated (%zu buffers, %zu bytes each)", _txNumBuffers, _txBufferLength);
+        }
+
+        _loopbackEnabled = true;
+        _txStreamSetup = true;
+        return kTxStream;
+    }
 }
 
 void SoapyLoopback::closeStream(SoapySDR::Stream *stream)
 {
     this->deactivateStream(stream, 0, 0);
-    _buffs.clear();
+
+    if (stream == kRxStream)
+    {
+        _buffs.clear();
+        _rxStreamSetup = false;
+    }
+    else if (stream == kTxStream)
+    {
+        _loopback_buffs.clear();
+        _loopback_head = 0;
+        _loopback_tail = 0;
+        _loopback_count = 0;
+        _loopback_overflow = false;
+        _loopbackEnabled = false;
+        _txStreamSetup = false;
+    }
 }
 
 size_t SoapyLoopback::getStreamMTU(SoapySDR::Stream *stream) const
 {
-    return bufferLength / BYTES_PER_SAMPLE;
+    const size_t bps = _loopbackBytesPerSample > 0 ? _loopbackBytesPerSample : BYTES_PER_SAMPLE;
+    return bufferLength / bps;
 }
 
 int SoapyLoopback::activateStream(
@@ -262,13 +324,25 @@ int SoapyLoopback::activateStream(
         const size_t numElems)
 {
     if (flags != 0) return SOAPY_SDR_NOT_SUPPORTED;
-    resetBuffer = true;
-    bufferedElems = 0;
 
-    //start the async thread
-    if (not _rx_async_thread.joinable())
+    if (stream == kRxStream)
     {
-        _rx_async_thread = std::thread(&SoapyLoopback::rx_async_operation, this);
+        // RX activation
+        resetBuffer = true;
+        bufferedElems = 0;
+
+        // Start the async thread only when loopback is NOT enabled
+        // (async thread provides synthetic data for RX-only usage)
+        if (not _loopbackEnabled and not _rx_async_thread.joinable())
+        {
+            _rx_async_thread = std::thread(&SoapyLoopback::rx_async_operation, this);
+        }
+    }
+    else if (stream == kTxStream)
+    {
+        // TX activation
+        _txActive = true;
+        _loopbackEnabled = true;
     }
 
     return 0;
@@ -277,10 +351,22 @@ int SoapyLoopback::activateStream(
 int SoapyLoopback::deactivateStream(SoapySDR::Stream *stream, const int flags, const long long timeNs)
 {
     if (flags != 0) return SOAPY_SDR_NOT_SUPPORTED;
-    if (_rx_async_thread.joinable())
+
+    if (stream == kRxStream)
     {
-        _rx_async_thread.join();
+        // Deactivate RX: join the async thread if running
+        if (_rx_async_thread.joinable())
+        {
+            _rx_async_thread.join();
+        }
     }
+    else if (stream == kTxStream)
+    {
+        // Deactivate TX: signal any waiting readers
+        _txActive = false;
+        _loopback_cond.notify_all();
+    }
+
     return 0;
 }
 
@@ -319,9 +405,16 @@ int SoapyLoopback::readStream(
 
     size_t returnedElems = std::min(bufferedElems, numElems);
 
+    // Determine bytes per sample based on loopback mode
+    // In loopback mode use the stored format, otherwise CS8 (2 bytes) for synthetic data
+    const size_t bytesPerSample = _loopbackEnabled ? _loopbackBytesPerSample : BYTES_PER_SAMPLE;
+
+    // Copy data to user's buffer
+    std::memcpy(buff0, _currentBuff, returnedElems * bytesPerSample);
+
     //bump variables for next call into readStream
     bufferedElems -= returnedElems;
-    _currentBuff += returnedElems*BYTES_PER_SAMPLE;
+    _currentBuff += returnedElems * bytesPerSample;
     bufTicks += returnedElems; //for the next call to readStream if there is a remainder
 
     //return number of elements written to buff0
@@ -353,6 +446,44 @@ int SoapyLoopback::acquireReadBuffer(
     long long &timeNs,
     const long timeoutUs)
 {
+    // When loopback is enabled, read from the loopback buffer (TX -> RX)
+    if (_loopbackEnabled)
+    {
+        // Handle loopback overflow
+        if (_loopback_overflow)
+        {
+            _loopback_head = (_loopback_head + _loopback_count.exchange(0)) % _txNumBuffers;
+            _loopback_overflow = false;
+            SoapySDR::log(SOAPY_SDR_SSI, "O");
+            return SOAPY_SDR_OVERFLOW;
+        }
+
+        // Wait for loopback data if none available
+        if (_loopback_count == 0)
+        {
+            std::unique_lock<std::mutex> lock(_loopback_mutex);
+            _loopback_cond.wait_for(lock, std::chrono::microseconds(timeoutUs),
+                [this]{ return _loopback_count != 0; });
+            if (_loopback_count == 0) return SOAPY_SDR_TIMEOUT;
+        }
+
+        // Extract from loopback buffer
+        handle = _loopback_head;
+        _loopback_head = (_loopback_head + 1) % _txNumBuffers;
+
+        auto &lbuff = _loopback_buffs[handle];
+        bufTicks = lbuff.tick;
+        timeNs = SoapySDR::ticksToTimeNs(lbuff.tick, sampleRate);
+        buffs[0] = (void *)lbuff.data.data();
+        flags = SOAPY_SDR_HAS_TIME;
+
+        // Use stored bytes per sample for the loopback format
+        size_t numElems = lbuff.data.size() / _loopbackBytesPerSample;
+        _loopback_count--;
+        return numElems;
+    }
+
+    // Original behavior: read from synthetic RX buffer
     //reset is issued by various settings
     //to drain old data out of the queue
     if (resetBuffer)
@@ -397,6 +528,73 @@ void SoapyLoopback::releaseReadBuffer(
     SoapySDR::Stream *stream,
     const size_t handle)
 {
+    // In loopback mode, _loopback_count is already decremented in acquireReadBuffer
+    // so we don't need to do anything here
+    if (_loopbackEnabled)
+    {
+        return;
+    }
+
     //TODO this wont handle out of order releases
     _buf_count--;
+}
+
+/*******************************************************************
+ * TX Stream API - writeStream
+ ******************************************************************/
+
+int SoapyLoopback::writeStream(
+        SoapySDR::Stream *stream,
+        const void * const *buffs,
+        const size_t numElems,
+        int &flags,
+        const long long timeNs,
+        const long timeoutUs)
+{
+    if (!_txActive)
+    {
+        SoapySDR_log(SOAPY_SDR_ERROR, "writeStream: TX not active");
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+
+    if (buffs == nullptr || buffs[0] == nullptr)
+    {
+        SoapySDR_log(SOAPY_SDR_ERROR, "writeStream: null buffer pointer");
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+
+    // Use the stored bytes per sample for the loopback format
+    const size_t numBytes = numElems * _loopbackBytesPerSample;
+
+    // Get input buffer
+    const char *input = (const char *)buffs[0];
+
+    // Check for overflow condition
+    if (_loopback_count >= _txNumBuffers)
+    {
+        _loopback_overflow = true;
+        SoapySDR::log(SOAPY_SDR_SSI, "U");  // Underflow on TX side means overflow on loopback
+        return SOAPY_SDR_OVERFLOW;
+    }
+
+    // Get the current tick for timestamps
+    unsigned long long tick = ticks.fetch_add(numElems);
+
+    // Copy data into loopback ring buffer
+    {
+        std::lock_guard<std::mutex> lock(_loopback_mutex);
+
+        auto &buff = _loopback_buffs[_loopback_tail];
+        buff.tick = tick;
+        buff.data.resize(numBytes);
+        std::memcpy(buff.data.data(), input, numBytes);
+
+        // Increment tail pointer
+        _loopback_tail = (_loopback_tail + 1) % _txNumBuffers;
+        _loopback_count++;
+    }
+
+    // Notify any waiting readers
+    _loopback_cond.notify_one();
+    return numElems;
 }

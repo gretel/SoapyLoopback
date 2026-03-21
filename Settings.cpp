@@ -44,11 +44,26 @@ SoapyLoopback::SoapyLoopback(const SoapySDR::Kwargs &args):
     gainMode(false),
     offsetMode(false),
     digitalAGC(false),
+    biasTee(false),
     ticks(false),
     bufferedElems(0),
     resetBuffer(false),
     gainMin(0.0),
-    gainMax(0.0)
+    gainMax(0.0),
+    // Stream setup tracking
+    _rxStreamSetup(false),
+    _txStreamSetup(false),
+    // TX/loopback state
+    _txActive(false),
+    _txBufferLength(DEFAULT_BUFFER_LENGTH),
+    _txNumBuffers(DEFAULT_NUM_BUFFERS),
+    _loopbackFormat(""),
+    _loopbackBytesPerSample(8),  // Default to CF32, will be set in setupStream
+    _loopback_head(0),
+    _loopback_tail(0),
+    _loopback_count(0),
+    _loopback_overflow(false),
+    _loopbackEnabled(false)
 {
 
 }
@@ -96,7 +111,7 @@ size_t SoapyLoopback::getNumChannels(const int dir) const
 
 bool SoapyLoopback::getFullDuplex(const int direction, const size_t channel) const
 {
-    return false;
+    return true;  // Support simultaneous TX and RX for loopback testing
 }
 
 /*******************************************************************
@@ -113,10 +128,7 @@ std::vector<std::string> SoapyLoopback::listAntennas(const int direction, const 
 
 void SoapyLoopback::setAntenna(const int direction, const size_t channel, const std::string &name)
 {
-    if (direction != SOAPY_SDR_RX)
-    {
-        throw std::runtime_error("setAntena failed: RTL-SDR only supports RX");
-    }
+    // Accept any antenna setting for both RX and TX
 }
 
 std::string SoapyLoopback::getAntenna(const int direction, const size_t channel) const

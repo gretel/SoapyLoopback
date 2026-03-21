@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.7)
+cmake_minimum_required(VERSION 3.10)
 project(SoapyLoopback CXX)
 
 find_package(SoapySDR "0.8.0" NO_MODULE REQUIRED)
