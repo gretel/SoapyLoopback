@@ -49,3 +49,13 @@ SOAPY_SDR_MODULE_UTIL(
         ${ATOMIC_LIBS}
         ${OTHER_LIBS}
 )
+
+# --- Tests ---
+enable_testing()
+add_executable(test_loopback test/test_loopback.cpp)
+target_link_libraries(test_loopback PRIVATE SoapySDR)
+target_compile_definitions(test_loopback PRIVATE
+    SOAPY_LOOPBACK_MODULE_PATH="$<TARGET_FILE:soapyloopback>")
+add_dependencies(test_loopback soapyloopback)
+add_test(NAME test_loopback COMMAND test_loopback)
+set_tests_properties(test_loopback PROPERTIES TIMEOUT 30)
